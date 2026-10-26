@@ -1,0 +1,147 @@
+@* A scientific calculator face. All the maths lives in SciCalc.Core; this file only draws keys and a display. *@
+
+<div class="stage">
+    <div class="calc" tabindex="0" @ref="_root" @onkeydown="OnKeyDown" aria-label="Scientific calculator">
+
+        <div class="brand">
+            <span class="model">SC-991</span>
+            <span class="tag">SCIENTIFIC CALCULATOR</span>
+        </div>
+
+        <div class="solar" aria-hidden="true">
+            @for (var i = 0; i < 4; i++)
+            {
+                <span class="cell"></span>
+            }
+        </div>
+
+        <div class="lcd" role="status" aria-live="polite" aria-label="@AriaDisplay">
+            <div class="flags">
+                <span class="flag @(_calc.Shift ? "on" : "")">S</span>
+                <span class="flag @(_calc.HasMemory ? "on" : "")">M</span>
+                <span class="flag on mode">@AngleText</span>
+            </div>
+            <div class="line1">
+                <span>@(_calc.Expression.Substring(0, _calc.Cursor))</span><span class="caret"></span><span>@(_calc.Expression.Substring(_calc.Cursor))</span>
+            </div>
+            <div class="line2 @(_calc.IsError ? "error" : "")">@(_calc.Result == "" && _calc.Expression == "" ? "0" : _calc.Result)</div>
+        </div>
+
+        <div class="keys">
+            @foreach (var k in Keys)
+            {
+                <div class="slot @k.Css">
+                    <span class="shiftlabel">@((MarkupString)(k.ShiftLabel ?? "&nbsp;"))</span>
+                    <button type="button" class="key @k.Css" aria-label="@k.Aria" @onclick="() => Press(k)">
+                        @((MarkupString)k.Label)
+                    </button>
+                </div>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private readonly Calculator _calc = new();
+    private ElementReference _root;
+
+    private sealed record KeyDef(string Label, string? ShiftLabel, string Cmd, string? ShiftCmd, string Css, string Aria);
+
+    private static KeyDef Fn(string label, string? shiftLabel, string cmd, string? shiftCmd, string aria) =>
+        new(label, shiftLabel, cmd, shiftCmd, "fn", aria);
+    private static KeyDef Num(string label, string cmd, string aria) => new(label, null, cmd, null, "num", aria);
+    private static KeyDef Op(string label, string cmd, string aria) => new(label, null, cmd, null, "op", aria);
+
+    private static readonly KeyDef[] Keys =
+    {
+        // top row
+        new("SHIFT", null, "shift", null, "shift small", "Shift"),
+        new("DRG", null, "drg", null, "ctrl small", "Angle unit: degrees, radians, gradians"),
+        new("&#9664;", null, "left", null, "ctrl small", "Move cursor left"),
+        new("&#9654;", null, "right", null, "ctrl small", "Move cursor right"),
+        new("M+", "M&minus;", "m+", "m-", "ctrl small", "Add to memory, shift subtracts"),
+
+        // scientific keys
+        Fn("x<sup>2</sup>", "x<sup>3</sup>", "ins:²", "ins:³", "Square, shift cube"),
+        Fn("x<sup>y</sup>", "<sup>x</sup>&radic;", "op:^", "op:ˣ√", "Power, shift x-th root"),
+        Fn("log", "10<sup>x</sup>", "ins:log(", "ins:10^(", "Logarithm base 10, shift ten to the power"),
+        Fn("ln", "e<sup>x</sup>", "ins:ln(", "ins:e^(", "Natural logarithm, shift e to the power"),
+        Fn("(&minus;)", "Ans", "ins:−", "ans", "Negative sign, shift previous answer"),
+
+        Fn("sin", "sin<sup>&minus;1</sup>", "ins:sin(", "ins:sin⁻¹(", "Sine, shift inverse sine"),
+        Fn("cos", "cos<sup>&minus;1</sup>", "ins:cos(", "ins:cos⁻¹(", "Cosine, shift inverse cosine"),
+        Fn("tan", "tan<sup>&minus;1</sup>", "ins:tan(", "ins:tan⁻¹(", "Tangent, shift inverse tangent"),
+        Fn("&radic;", "&#8731;", "ins:√(", "ins:∛(", "Square root, shift cube root"),
+        Fn("x<sup>&minus;1</sup>", "x!", "ins:⁻¹", "ins:!", "Reciprocal, shift factorial"),
+
+        Fn("(", null, "ins:(", null, "Open bracket"),
+        Fn(")", "&pi;", "ins:)", "ins:π", "Close bracket, shift pi"),
+        Fn("nPr", "nCr", "ins:P", "ins:C", "Permutations, shift combinations"),
+        Fn("Abs", "MR", "ins:Abs(", "mr", "Absolute value, shift memory recall"),
+        Fn("%", "MC", "ins:%", "mc", "Percent, shift memory clear"),
+
+        // number pad
+        Num("7", "ins:7", "7"), Num("8", "ins:8", "8"), Num("9", "ins:9", "9"),
+        new("DEL", null, "del", null, "del", "Delete"),
+        new("AC", null, "ac", null, "ac", "All clear"),
+
+        Num("4", "ins:4", "4"), Num("5", "ins:5", "5"), Num("6", "ins:6", "6"),
+        Op("&times;", "op:×", "Multiply"), Op("&divide;", "op:÷", "Divide"),
+
+        Num("1", "ins:1", "1"), Num("2", "ins:2", "2"), Num("3", "ins:3", "3"),
+        Op("+", "op:+", "Add"), Op("&minus;", "op:−", "Subtract"),
+
+        Num("0", "ins:0", "0"), Num(".", "ins:.", "Decimal point"),
+        new("EXP", "e", "ins:E", "ins:e", "num", "Times ten to the power, shift Euler's number"),
+        new("Ans", null, "ans", null, "num", "Previous answer"),
+        new("=", null, "eq", null, "eq", "Equals"),
+    };
+
+    private string AngleText => _calc.Angle switch
+    {
+        AngleMode.Deg => "DEG",
+        AngleMode.Rad => "RAD",
+        _ => "GRA",
+    };
+
+    private string AriaDisplay =>
+        $"Expression {(_calc.Expression == "" ? "empty" : _calc.Expression)}. {(_calc.Result == "" ? "" : "Result " + _calc.Result)}";
+
+    private void Press(KeyDef key)
+    {
+        var cmd = _calc.Shift && key.ShiftCmd is not null ? key.ShiftCmd : key.Cmd;
+        // Shift on a key with no second function just clears shift.
+        _calc.Execute(cmd);
+    }
+
+    private void OnKeyDown(KeyboardEventArgs e)
+    {
+        var cmd = e.Key switch
+        {
+            "0" or "1" or "2" or "3" or "4" or "5" or "6" or "7" or "8" or "9" => "ins:" + e.Key,
+            "." or "," => "ins:.",
+            "+" => "op:+",
+            "-" => "op:−",
+            "*" or "x" => "op:×",
+            "/" => "op:÷",
+            "^" => "op:^",
+            "(" => "ins:(",
+            ")" => "ins:)",
+            "!" => "ins:!",
+            "%" => "ins:%",
+            "Enter" or "=" => "eq",
+            "Backspace" or "Delete" => "del",
+            "Escape" => "ac",
+            "ArrowLeft" => "left",
+            "ArrowRight" => "right",
+            _ => null,
+        };
+        if (cmd is not null) _calc.Execute(cmd);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        // Let a keyboard work straight away on a computer.
+        if (firstRender) await _root.FocusAsync(preventScroll: true);
+    }
+}

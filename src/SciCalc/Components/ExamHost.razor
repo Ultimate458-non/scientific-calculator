@@ -1,0 +1,328 @@
+@implements IAsyncDisposable
+@inject IJSRuntime JS
+
+@* Wraps the calculator. In exam mode it watches for the student leaving, warns, locks and keeps a time-stamped record. *@
+
+<div class="@(Active ? "exam-pad" : "")">
+    @ChildContent
+</div>
+
+@if (Active)
+{
+    <div class="exam-bar @(_s!.State.Violations == 0 ? "ok" : _s.State.Violations == 1 ? "warn" : "bad")" role="status">
+        <span class="who">EXAM &middot; @_s.State.StudentName</span>
+        <span>Left: @_s.State.Violations</span>
+        @if (_s.TimeLeft(Now) is { } left)
+        {
+            <span>&#9201; @Clock(left)</span>
+        }
+    </div>
+}
+else if (_mode == Mode.Off)
+{
+    <button type="button" class="exam-open" @onclick="OpenSetup" aria-label="Start exam mode">&#128274; Exam mode</button>
+}
+
+@if (_mode == Mode.Setup)
+{
+    <div class="exam-overlay" role="dialog" aria-modal="true" aria-label="Set up exam mode">
+        <div class="exam-card">
+            <h2>Exam mode</h2>
+            <p class="muted">For the invigilator to set up before the student starts.</p>
+
+            <label>Student name
+                <input @bind="_name" @bind:event="oninput" autocomplete="off" />
+            </label>
+            <label>Student number (optional)
+                <input @bind="_studentId" @bind:event="oninput" autocomplete="off" />
+            </label>
+            <label>Invigilator PIN (4 or more characters)
+                <input type="password" @bind="_pin" @bind:event="oninput" autocomplete="off" />
+            </label>
+            <label>Exam length in minutes (0 = no limit)
+                <input type="number" inputmode="numeric" min="0" max="600" @bind="_minutes" @bind:event="oninput" />
+            </label>
+
+            @if (_error != "") { <p class="err">@_error</p> }
+
+            <div class="notice">
+                <strong>What this does</strong>
+                <ul>
+                    <li>If the student leaves the calculator (another app, home button, locking the screen, pulling down the notification bar) it is recorded with the time.</li>
+                    <li>1st time: a warning. 2nd time onwards: the calculator locks and sounds an alarm and vibrates until you enter the PIN.</li>
+                    <li>It cannot see which app was opened, only that the student left and for how long.</li>
+                    <li>Tell students before the exam that this is recorded.</li>
+                </ul>
+                <strong>Lock the phone properly too</strong>
+                <ul>
+                    <li><strong>Android:</strong> turn on Screen pinning (Settings &rarr; Security), open this page, then pin it from the Recent apps screen.</li>
+                    <li><strong>iPhone:</strong> turn on Guided Access (Settings &rarr; Accessibility), open this page, then triple-click the side button.</li>
+                </ul>
+                <p class="muted">This phone: vibration @(_canVibrate ? "works" : "is not available (the alarm will be sound and screen only)"), full screen @(_canFullscreen ? "works" : "is not available").</p>
+            </div>
+
+            <div class="row">
+                <button type="button" class="btn ghost" @onclick="CloseOverlay">Cancel</button>
+                @if (_hasLast) { <button type="button" class="btn ghost" @onclick="ShowLast">Last record</button> }
+                <button type="button" class="btn go" @onclick="StartExam">Start exam</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_mode == Mode.Report && _report != "")
+{
+    <div class="exam-overlay" role="dialog" aria-modal="true" aria-label="Exam record">
+        <div class="exam-card">
+            <h2>Exam record</h2>
+            <pre class="report">@_report</pre>
+            <div class="row">
+                <button type="button" class="btn ghost" @onclick="CopyReport">@(_copied ? "Copied" : "Copy")</button>
+                <button type="button" class="btn ghost" @onclick="DownloadReport">Save file</button>
+                <button type="button" class="btn go" @onclick="CloseOverlay">Close</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (Active && _needsFullscreen && !Locked && !Warning)
+{
+    <div class="exam-overlay soft" role="dialog" aria-modal="true">
+        <div class="exam-card small">
+            <h2>Back to full screen</h2>
+            <p>Tap to continue the exam in full screen.</p>
+            <button type="button" class="btn go" @onclick="ReenterFullscreen">Continue</button>
+        </div>
+    </div>
+}
+
+@if (Active && Warning && !Locked)
+{
+    <div class="exam-overlay warn" role="alertdialog" aria-modal="true" aria-label="Warning">
+        <div class="exam-card small">
+            <h2>&#9888; Warning</h2>
+            <p>You left the calculator. This was recorded with the time.</p>
+            <p><strong>If you leave again, the calculator will lock and an alarm will sound for the invigilator.</strong></p>
+            <button type="button" class="btn go" @onclick="AcknowledgeWarning">I understand</button>
+        </div>
+    </div>
+}
+
+@if (Active && Locked)
+{
+    <div class="exam-overlay lock" role="alertdialog" aria-modal="true" aria-label="Calculator locked">
+        <div class="exam-card small">
+            <h2>@(_s!.State.TimeUp ? "Time is up" : "\U0001F512 Calculator locked")</h2>
+            <p>@(_s.State.TimeUp ? "Hand your phone to the invigilator." : "You left the calculator more than once. The invigilator has been alerted. Hand your phone to the invigilator.")</p>
+            <label>Invigilator PIN
+                <input type="password" @bind="_unlockPin" @bind:event="oninput" autocomplete="off" />
+            </label>
+            @if (_error != "") { <p class="err">@_error</p> }
+            <div class="row">
+                @if (!_s.State.TimeUp) { <button type="button" class="btn go" @onclick="TryUnlock">Unlock</button> }
+                <button type="button" class="btn ghost" @onclick="TryEnd">End exam</button>
+            </div>
+        </div>
+    </div>
+}
+
+@code {
+    private enum Mode { Off, Setup, Report }
+
+    private const string Key = "scicalc:exam";
+
+    [Parameter] public RenderFragment? ChildContent { get; set; }
+
+    private ExamSession? _s;
+    private Mode _mode = Mode.Off;
+    private DotNetObjectReference<ExamHost>? _ref;
+    private Timer? _timer;
+
+    private string _name = "", _studentId = "", _pin = "", _unlockPin = "", _error = "", _report = "";
+    private int _minutes;
+    private bool _canVibrate, _canFullscreen, _hasLast, _copied, _needsFullscreen;
+
+    private static DateTimeOffset Now => DateTimeOffset.UtcNow;
+    private bool Active => _s is { State.Active: true };
+    private bool Locked => _s is { State.Locked: true };
+    private bool Warning => _s is { State.WarningPending: true };
+
+    private static string Clock(TimeSpan t) => $"{(int)t.TotalMinutes:00}:{t.Seconds:00}";
+
+    protected override async Task OnInitializedAsync()
+    {
+        _canVibrate = await JS.InvokeAsync<bool>("examGuard.canVibrate");
+        _canFullscreen = await JS.InvokeAsync<bool>("examGuard.canFullscreen");
+
+        var json = await JS.InvokeAsync<string?>("localStorage.getItem", Key);
+        if (string.IsNullOrEmpty(json)) return;
+        try
+        {
+            var state = System.Text.Json.JsonSerializer.Deserialize(json, ExamJsonContext.Default.ExamState);
+            if (state is null) return;
+            _s = new ExamSession(state);
+            _hasLast = !state.Active;
+            if (state.Active)
+            {
+                // The page was reloaded in the middle of an exam. That counts as leaving.
+                var outcome = _s.Resumed(Now);
+                _ref = DotNetObjectReference.Create(this);
+                await JS.InvokeVoidAsync("examGuard.resume", _ref);
+                _needsFullscreen = _canFullscreen;
+                if (outcome == ReturnOutcome.Locked) await JS.InvokeVoidAsync("examGuard.alarm", true);
+                await Save();
+                StartTimer();
+            }
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            // A damaged record is ignored.
+        }
+    }
+
+    private Task Save() =>
+        _s is null ? Task.CompletedTask
+            : JS.InvokeVoidAsync("localStorage.setItem", Key,
+                System.Text.Json.JsonSerializer.Serialize(_s.State, ExamJsonContext.Default.ExamState)).AsTask();
+
+    private void StartTimer() => _timer ??= new Timer(_ => _ = InvokeAsync(Tick), null, 1000, 1000);
+
+    private async Task Tick()
+    {
+        if (_s is null || !_s.State.Active) return;
+        if (_s.CheckTime(Now)) await Save();
+        StateHasChanged();
+    }
+
+    private void OpenSetup()
+    {
+        _error = "";
+        _mode = Mode.Setup;
+    }
+
+    private void CloseOverlay()
+    {
+        _mode = Mode.Off;
+        _error = "";
+        _copied = false;
+    }
+
+    private async Task StartExam()
+    {
+        try
+        {
+            var offset = await JS.InvokeAsync<int>("examGuard.utcOffset");
+            _s = ExamSession.Start(_name, _studentId, _pin, _minutes, offset, Now);
+        }
+        catch (ArgumentException e)
+        {
+            _error = e.Message;
+            return;
+        }
+        _error = "";
+        _pin = "";
+        _mode = Mode.Off;
+        _needsFullscreen = false;
+        _ref = DotNetObjectReference.Create(this);
+        await JS.InvokeVoidAsync("examGuard.start", _ref);
+        await Save();
+        StartTimer();
+    }
+
+    private async Task ReenterFullscreen()
+    {
+        _needsFullscreen = false;
+        await JS.InvokeVoidAsync("examGuard.goFullscreen");
+    }
+
+    [JSInvokable]
+    public async Task OnAway(string reason)
+    {
+        if (_s is null) return;
+        _s.Left(reason, Now);
+        await Save();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public async Task OnBack()
+    {
+        if (_s is null) return;
+        var outcome = _s.Returned(Now);
+        if (outcome == ReturnOutcome.Locked) await JS.InvokeVoidAsync("examGuard.alarm", true);
+        else if (outcome == ReturnOutcome.Warning) await JS.InvokeVoidAsync("examGuard.shortBuzz");
+        await Save();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    [JSInvokable]
+    public async Task OnFullscreenExit()
+    {
+        if (_s is null) return;
+        _s.FullscreenExited(Now);
+        _needsFullscreen = _canFullscreen;
+        await Save();
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task AcknowledgeWarning()
+    {
+        _s?.AcknowledgeWarning();
+        await Save();
+    }
+
+    private async Task TryUnlock()
+    {
+        if (_s is null) return;
+        if (_s.TryUnlock(_unlockPin, Now))
+        {
+            _unlockPin = "";
+            _error = "";
+            await JS.InvokeVoidAsync("examGuard.alarm", false);
+            await Save();
+        }
+        else _error = "Wrong PIN.";
+    }
+
+    private async Task TryEnd()
+    {
+        if (_s is null) return;
+        if (!_s.TryEnd(_unlockPin, Now))
+        {
+            _error = "Wrong PIN.";
+            return;
+        }
+        _unlockPin = "";
+        _error = "";
+        await JS.InvokeVoidAsync("examGuard.stop");
+        _timer?.Dispose();
+        _timer = null;
+        await Save();
+        _hasLast = true;
+        _report = _s.Report(Now);
+        _mode = Mode.Report;
+    }
+
+    private void ShowLast()
+    {
+        if (_s is null) return;
+        _report = _s.Report(Now);
+        _mode = Mode.Report;
+    }
+
+    private async Task CopyReport() => _copied = await JS.InvokeAsync<bool>("examGuard.copy", _report);
+
+    private async Task DownloadReport()
+    {
+        var who = new string((_s?.State.StudentName ?? "student").Where(char.IsLetterOrDigit).ToArray());
+        await JS.InvokeVoidAsync("examGuard.download", $"exam-record-{who}-{Now:yyyyMMdd-HHmm}.txt", _report);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _timer?.Dispose();
+        _ref?.Dispose();
+        if (Active) return; // leave the guard running; the page is going away
+        await Task.CompletedTask;
+    }
+}
